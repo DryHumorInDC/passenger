@@ -113,13 +113,15 @@ function onError(e) {
 	if (routerState == 1) {
 		log.error("Unable to connect to UstRouter at [" + ustRouterAddress +"], will auto-retry.");
 	} else {
-		log.error("Unexpected error in UstRouter connection: " + e + ", will auto-retry.");
+		// could be called when e.g. a write fails
+		log.error("Uncategorized error in UstRouter connection: " + e + ", will auto-retry.");
 	}
-	changeState(0, "onError");
+	resetState("onError");
 }
 
 function onEnd() {
-	changeState(0, "onEnd");
+	// e.g. when connection dies
+	resetState("onEnd");
 }
 
 exports.getTxnIdFromRequest = function(req) {
@@ -131,7 +133,7 @@ function LogTransaction(cat) {
 	this.category = cat;
 	this.txnId = "";
 	this.logBuf = [];
-	this.state = 1;
+	this.state = 0; // 0: untouched, 1: open sent, 2: close sent
 }
 
 // Example categories are "requests", "exceptions". The lineArray is a specific format parsed by Union STation.
@@ -152,7 +154,7 @@ exports.logToUstTransaction = function(category, lineArray, txnIfContinue) {
 		
 		pendingTxnBuf.push(logTxn);
 	} else {
-		log.debug("Dropping transaction due to outgoing buffer limit (" + pendingTxnBufMaxLength + ") reached");
+		log.debug("Dropping Union Station log due to outgoing buffer limit (" + pendingTxnBufMaxLength + ") reached");
 	}
 	
 	pushPendingData();
@@ -161,7 +163,7 @@ exports.logToUstTransaction = function(category, lineArray, txnIfContinue) {
 function verifyOk(rcvString, topic) {
 	if ("status" != rcvString[0] || "ok" != rcvString[1]) {
 		log.error("Error with " + topic + ": [" + rcvString + "], will auto-retry.");
-		changeState(0, "not OK reply");
+		resetState("not OK reply");
 		return false;
 	}
 	return true;
@@ -183,32 +185,46 @@ function pushPendingData() {
 		return; // no pending
 	}
 	
-	if (pendingTxnBuf[0].state == 1) {
-		// still need to open the txn
-		changeState(6); // expect ok/txnid in onData()..
-		setWatchdog(connTimeoutMs);
-		log.debug("open transaction(" + pendingTxnBuf[0].txnId + ")");
-		writeLenArray(routerConn, "openTransaction\0" + pendingTxnBuf[0].txnId + "\0" + appGroupName + "\0" + nodeName + "\0" + 
-			pendingTxnBuf[0].category +	"\0" + codify.toCode(pendingTxnBuf[0].timestamp) + "\0" + ustGatewayKey + "\0true\0true\0\0");
-	} else {
-		// txn is open, log the data & close
-		log.debug("log & close transaction(" + pendingTxnBuf[0].txnId + ")");
-		txn = pendingTxnBuf.shift();
-		for (i = 0; i < txn.logBuf.length; i++) {
-			writeLenArray(routerConn, "log\0" + txn.txnId + "\0" + codify.toCode(txn.timestamp) + "\0");
-			writeLenString(routerConn, txn.logBuf[i]);
-		}
+	switch (pendingTxnBuf[0].state) {
+		case 0:
+			// still need to open the txn
+			changeState(6); // expect ok/txnid in onData()..
+			setWatchdog(connTimeoutMs);
+			log.debug("open transaction(" + pendingTxnBuf[0].txnId + ")");
+			pendingTxnBuf[0].state = 1;
+			writeLenArray(routerConn, "openTransaction\0" + pendingTxnBuf[0].txnId + "\0" + appGroupName + "\0" + nodeName + "\0" + 
+				pendingTxnBuf[0].category +	"\0" + codify.toCode(pendingTxnBuf[0].timestamp) + "\0" + ustGatewayKey + "\0true\0true\0\0");
+			break;
 
-		changeState(7); // expect ok in onData()..
-		setWatchdog(connTimeoutMs);
-		writeLenArray(routerConn, "closeTransaction\0" + txn.txnId + "\0" + codify.toCode(microtime.now()) + "\0true\0");
+		case 1:
+			// open was sent, still waiting for OK.
+			break;
+			
+		case 2:			
+			// txn is open, log the data & close
+			log.debug("log & close transaction(" + pendingTxnBuf[0].txnId + ")");
+			txn = pendingTxnBuf.shift();
+			for (i = 0; i < txn.logBuf.length; i++) {
+				writeLenArray(routerConn, "log\0" + txn.txnId + "\0" + codify.toCode(txn.timestamp) + "\0");
+				writeLenString(routerConn, txn.logBuf[i]);
+			}
+	
+			changeState(7); // expect ok in onData()..
+			setWatchdog(connTimeoutMs);
+			writeLenArray(routerConn, "closeTransaction\0" + txn.txnId + "\0" + codify.toCode(microtime.now()) + "\0true\0");
+			break;
+		
+		default:
+			log.error("Unexpected pendingTxnBuf[0].state " + pendingTxnBuf[0].state + ", discarding it.");
+			pendingTxnBuf.shift();
+			break;
 	}	
 }
 
 var watchDogId;
 
 function onWatchdogTimeout() {
-	changeState(0, "onWatchdogTimeout");
+	resetState("onWatchdogTimeout");
 }
 
 // Resets the connection if there is no progress in the next timeoutMs.
@@ -267,7 +283,7 @@ function onData(data) {
 				writeLenString(routerConn, ustRouterPass);
 			} else {
 				log.error("Error with UstRouter version: [" + rcvString + "], will auto-retry.");
-				changeState(0, "not OK reply");
+				resetState("not OK version reply");
 			}
 			break;
 
@@ -315,22 +331,30 @@ function onData(data) {
 	}
 }
 
+function resetState(reason) {
+	changeState(0, reason);
+
+	// When experiencing a mid-transaction failure (pending transaction state is increased once a transaction open has 
+	// been sent), we don't really know what the other side remembers about the transaction (e.g. nothing if it crashed).
+	// It's even possible that the transaction itself is causing the problem (e.g. invalid category), so we choose to
+	// drop it and disconnect. The drop avoids getting stuck on invalid txns and the disconnect cleans up remote resources.
+	if (pendingTxnBuf.length > 0 && pendingTxnBuf[0].state != 0) {
+		log.debug("Mid-transaction (id: " + pendingTxnBuf[0].txnId + ") failure: drop/skipping Union Station log");
+		pendingTxnBuf.shift();
+	}
+
+	// ensure connection is finished and we don't get any outdated triggers 
+	resetWatchdog();
+
+	if (routerConn) {
+		routerConn.destroy();
+	}
+}
+
 function changeState(newRouterState, optReason) {
 	log.debug("routerState: " + routerState + " -> " + newRouterState + (optReason ? " due to: " + optReason : ""));
-	
+
 	routerState = newRouterState;
-	if (newRouterState == 0) {
-		// If the old state was mid-transaction (routerState 6 or 7), we don't really know what the other side remembers
-		// about the transaction (e.g. nothing if it crashed). On our side we choose to just reconnect and continue
-		// where we left off (e.g. resend the pushPendingData after reconnect pendingTxnBuf[0].state 2
-		  
-		// ensure connection is finished and we don't get any outdated triggers 
-		resetWatchdog();
-		
-		if (routerConn) {
-			routerConn.destroy();
-		}
-	}
 }
 
 function writeLenString(c, str) {
