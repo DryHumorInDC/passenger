@@ -93,6 +93,11 @@ function collectionFn(origArguments, databaseName, collectionName, functionName,
 
 	var attachToTxnId = clStore.get("attachToTxnId");
 	log.verbose("==== Instrumentation [MongoDB] ==== [" + query + "] (attach to txnId " + attachToTxnId + ")");
+	
+	if (!attachToTxnId) {
+		log.verbose("Dropping Union Station log due to lack of txnId to attach to (either request was not intercepted or temporary UstRouter failure).");
+		return rval;
+	}
 
 	var logBuf = [];
 	var uniqueTag = codify.toCode(tBegin);

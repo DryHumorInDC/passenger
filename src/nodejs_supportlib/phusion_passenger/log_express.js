@@ -91,15 +91,19 @@ exports.initPostLoad = function() {
 }
 
 function logRequest(req, res, next) {
-	log.verbose("==== Instrumentation [Express] ==== REQUEST [" + req.method + " " + req.url + "]");
+	var attachToTxnId = ustLog.getTxnIdFromRequest(req);
+	log.verbose("==== Instrumentation [Express] ==== REQUEST [" + req.method + " " + req.url + "] (attach to txnId " + attachToTxnId + ")");
 
+	if (!attachToTxnId) {
+		log.debug("Dropping Union Station log due to lack of txnId from Passenger Core (probably a temporary UstRouter failure)");
+		return next();
+	}
+	
 	var logBuf = [];
 	logBuf.push("Got request for: " + req.url);
 
 	clStore.bindEmitter(req);
 	clStore.bindEmitter(res);
-
-	var attachToTxnId = ustLog.getTxnIdFromRequest(req);
 
 	ustLog.logToUstTransaction("requests", logBuf, attachToTxnId);
 
@@ -112,7 +116,7 @@ function logRequest(req, res, next) {
 function logException(err, req, res, next) {
 	// We may have multiple exception handlers in the routing chain, ensure only the first one actually logs.
 	if (!res.hasLoggedException) {
-		log.verbose("==== Instrumentation [Express] ==== EXCEPTION + TRACE FOR [" + req.url + "]");
+		log.verbose("==== Instrumentation [Express] ==== EXCEPTION + TRACE FOR [" + req.url + "] (new txn)");
 
 		var logBuf = [];
 		logBuf.push("Request transaction ID: " + ustLog.getTxnIdFromRequest(req));
