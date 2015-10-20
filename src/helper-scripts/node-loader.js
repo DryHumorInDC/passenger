@@ -110,7 +110,7 @@ function setupEnvironment(options) {
 	var winston = require("winston");
 	var logger = new (winston.Logger)({
   		transports: [ 
-  			new (winston.transports.Console)({ level: logLevel })
+  			new (winston.transports.Console)({ level: logLevel, debugStdout: true })
   		]
 	});
 	
