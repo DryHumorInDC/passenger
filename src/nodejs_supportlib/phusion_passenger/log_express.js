@@ -131,23 +131,3 @@ function logException(err, req, res, next) {
 	}
 	next(err);
 }
-
-// DEBUG
-//var Module = require('module')
-
-//Module.loadOrig = Module._load;
-//Module._load = function(request, parent, isMain) { log.info("load: [" + request + ", " +parent+","+isMain+ "]"); return Module.loadOrig(request, parent, isMain); };
-
-//http.createServerOrig = http.createServer;
-//http.createServer = createServerTap;
-
-//var appTap;
-//function createServerTap(listener) {
-	//log.info("CREATE SERVER TAP got "+ listener);
-	//appTap = listener;
-	//appTap.use(logException);
-
-	//http.createServer = http.createServerOrig;
-
-	//return http.createServer(listener);
-//}
