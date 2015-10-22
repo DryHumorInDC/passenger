@@ -25,21 +25,22 @@
 
 var log;
 var net = require('net');
-var os = require("os");
+var os = require('os');
 var nbo = require('network-byte-order');
 var codify = require('codify');
 var microtime = require('microtime');
 
-var ustRouterAddress; // standalone = "localhost:9344";
+var ustRouterAddress; // will normally be a unix sock, although there is a default standalone = "tcp://127.0.0.1:9344";
+var ustRouterPort; // if not a unix sock
 var ustRouterUser;
 var ustRouterPass;
 var ustGatewayKey;
 
-var nodeName = os.hostname();
+var nodeName;
 var appGroupName;
 
 var routerConn;
-var routerState = -1;
+var routerState;
 // -1: disabled (not initialized or unrecoverable error, won't try to reconnect without new init)
 // 0: disconnected, ready to (re)try connect
 // 1: awaiting connect
@@ -50,9 +51,20 @@ var routerState = -1;
 // 6: awaiting openTransaction OK
 // 7: awaiting closeTransaction OK
 
-var pendingTxnBuf = [];
-var pendingTxnBufMaxLength = 5000;
-var connTimeoutMs = 10000;
+var pendingTxnBuf;
+var pendingTxnBufMaxLength;
+var connTimeoutMs;
+var autoRetryAfterMs;
+
+setDefaults();
+function setDefaults() {
+	nodeName = os.hostname();
+	routerState = -1;
+	pendingTxnBuf = [];
+	pendingTxnBufMaxLength = 5000;
+	connTimeoutMs = 10000;
+	autoRetryAfterMs = 10000;
+}
 
 // Call to initiate a connection with the UstRouter. If called with incomplete parameters the connector will just be
 // disabled (isEnabled() will return false) and no further actions will be taken. If the connection fails, it is auto-retried
@@ -71,12 +83,19 @@ exports.init = function(logger, routerAddress, routerUser, routerPass, gatewayKe
 	ustGatewayKey = gatewayKey;
 	appGroupName = groupName;
 	
-	// createConnection doesn't understand the "unix:" prefix, but it does understand the path that follows.
-	if (ustRouterAddress.indexOf("unix:") == 0) {
-		ustRouterAddress = ustRouterAddress.substring(5);
+	if (ustRouterAddress) {
+		if (ustRouterAddress.indexOf("unix:") == 0) {
+			// createConnection doesn't understand the "unix:" prefix, but it does understand the path that follows.
+			ustRouterAddress = ustRouterAddress.substring(5);
+		} else if (ustRouterAddress.indexOf("tcp://") == 0) {
+			var hostAndPort = ustRouterAddress.substring(6).split(':');
+			ustRouterAddress = hostAndPort[0];
+			ustRouterPort = hostAndPort[1];
+		}
 	}
-	log.debug("initialize ustrouter_connector with [routerAddress:" + ustRouterAddress + "] [user:" + ustRouterUser + "] [pass:" + ustRouterPass + "] [key:" + 
-		ustGatewayKey + "] [app:" + appGroupName + "]");
+	log.debug("initialize ustrouter_connector with [routerAddress:" + ustRouterAddress + "] " + 
+		(ustRouterPort ? "[ustRouterPort:" + ustRouterPort + "] " : "") + "[user:" + ustRouterUser + "] [pass:" + 
+		ustRouterPass + "] [key:" +	ustGatewayKey + "] [app:" + appGroupName + "]");
 
 	if (!ustRouterAddress || !ustRouterUser || !ustRouterPass || !ustGatewayKey || !appGroupName) {
 		log.verbose("Union Station logging disabled (incomplete configuration).");
@@ -88,6 +107,10 @@ exports.init = function(logger, routerAddress, routerUser, routerPass, gatewayKe
 	beginConnection();
 }
 
+exports.finit = function() {
+	resetState("finit()");
+}
+
 exports.isEnabled = function() {
 	return routerState >= 0;
 }
@@ -96,8 +119,12 @@ function beginConnection() {
 	changeState(1);
 
 	setWatchdog(connTimeoutMs); // Watchdog for the entire connect-to-ustRouter process.
-	
-	routerConn = net.createConnection(ustRouterAddress);
+
+	if (ustRouterPort) { 
+		routerConn = net.createConnection(ustRouterPort, ustRouterAddress);
+	} else {
+		routerConn = net.createConnection(ustRouterAddress);
+	}
 
 	routerConn.on("connect", onConnect);
 	routerConn.on("error", onError);
@@ -252,14 +279,14 @@ function readLenArray(newData) {
 	log.silly("need more header data..");
 		return null; // expecting at least length bytes
 	}
-	lenRcv = nbo.ntohs(new Buffer(readBuf), 0);
-	log.silly("read: lenRCv = " + lenRcv);
-	if (readBuf.length < 2 + lenRcv) {
+	payloadLen = nbo.ntohs(new Buffer(readBuf), 0);
+	log.silly("read: payloadLen = " + payloadLen);
+	if (readBuf.length < 2 + payloadLen) {
 	log.silly("need more payload data..");
 		return null; // not fully read yet
 	}
-	resultStr = readBuf.substring(2, lenRcv + 2);
-	readBuf = readBuf.substring(lenRcv + 2); // keep any bytes read beyond length for next read
+	resultStr = readBuf.substring(2, payloadLen + 2);
+	readBuf = readBuf.substring(payloadLen + 2); // keep any bytes read beyond length for next read
 	
 	return resultStr.split("\0");
 }
@@ -349,6 +376,8 @@ function resetState(reason) {
 	if (routerConn) {
 		routerConn.destroy();
 	}
+	
+	setTimeout(function() { pushPendingData(); }, autoRetryAfterMs);
 }
 
 function changeState(newRouterState, optReason) {
@@ -369,4 +398,15 @@ function writeLenArray(c, str) {
 	nbo.htons(len, 0, str.length);
 	c.write(len);
 	c.write(str);
+}
+
+if (process.env.NODE_ENV === 'test') {
+	exports.setDefaults = setDefaults;
+	exports.pushPendingData = pushPendingData;
+	
+	exports.getRouterState = function() { return routerState; };
+	exports.setPendingTxnBufMaxLength = function(val) { pendingTxnBufMaxLength = val; };
+	exports.getPendingTxnBuf = function() { return pendingTxnBuf; };	
+	exports.setConnTimeoutMs = function(val) { connTimeoutMs = val; };
+	exports.setAutoRetryAfterMs = function(val) { autoRetryAfterMs = val; };
 }
