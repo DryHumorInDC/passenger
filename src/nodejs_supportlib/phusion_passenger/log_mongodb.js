@@ -27,8 +27,7 @@ var log;
 var codify = require('codify');
 var microtime = require('microtime');
 
-var getNamespace = require('continuation-local-storage').getNamespace;
-var clStore = getNamespace('passenger-request-ctx');
+var reqNamespace = require('continuation-local-storage').getNamespace('passenger-request-ctx');
 
 var mongodb;
 var ustLog;
@@ -45,17 +44,9 @@ function instrumentCollectionMethod(origParent, functionName, newFn) {
 	var originalFn = origParent[functionName];
 
 	// not used yet (unwrapping N/I)
-	origParent["_passenger_wrapped_original_" + functionName] = originalFn;
+	origParent["_passenger_wrapped_" + functionName] = originalFn;
 
 	origParent[functionName] = function() {
-		//log.debug("INTERCEPTED COLLECTION FUNCTION CALLED:" + require('util').inspect(this, true, null));
-
-		//log.debug("NAME: " + clStore.get("attachToTxnId"));
-
-		//log.debug("THIS: " + require('util').inspect(this));
-		//log.debug("ARGS: " + require('util').inspect(arguments));
-		//log.debug("CLSTORE: " + clStore.get("attachToTxnId"));
-
 		var databaseName;
 		var collectionName;
 
@@ -91,11 +82,13 @@ function collectionFn(origArguments, databaseName, collectionName, functionName,
 	var rval = originalFn.apply(this, origArguments);
 	var tEnd = microtime.now();
 
-	var attachToTxnId = clStore.get("attachToTxnId");
+	// var reqNamespace = localStorage.getNamespace('passenger-request-ctx');
+	var attachToTxnId = reqNamespace.get("attachToTxnId");
 	log.verbose("==== Instrumentation [MongoDB] ==== [" + query + "] (attach to txnId " + attachToTxnId + ")");
 	
 	if (!attachToTxnId) {
 		log.verbose("Dropping Union Station log due to lack of txnId to attach to (either request was not intercepted or temporary UstRouter failure).");
+		console.trace("Call stack:");
 		return rval;
 	}
 
@@ -113,67 +106,110 @@ exports.initPreLoad = function(logger, appRoot, ustLogger) {
 	log = logger;
 	ustLog = ustLogger;
 
+	// See if the mongodb driver is used. It can also be used through mongoskin, in which case older mongoskin
+	// versions will have it as part of their own node_modules.
 	try {
 		mongodb = require(appRoot + "/node_modules/mongodb");
 	} catch (e1) {
 		try {
 			mongodb = require(appRoot + "/node_modules/mongoskin/node_modules/mongodb");
 		} catch (e2) {
-			log.debug("Not instrumenting MongoDB (probably not used): (default) " + e1 + ", (mongoskin) " + e2);
+			log.verbose("Not instrumenting MongoDB (probably not used): (default) " + e1 + ", (mongoskin) " + e2);
 			return;
 		}
 	}
+
+	log.info("==== Instrumentation [MongoDB] ==== initialize");
+
+	// The 1.4 mongo driver series uses a callback mechanism that breaks continuation-local-storage.
+	wrapRepairCLSMongo14();
+		
+	// Newer mongoskin techniques break continuation-local-storage, so we need to skin the skinner there.
+	wrapRepairCLSMongoskinUtils(appRoot);
 	
 	try {
-		log.info("==== Instrumentation [MongoDB] ==== initialize");
-
-		//mongodb.Db.prototype.collectionOrig = mongodb.Db.prototype.collection;
-		//mongodb.Db.prototype.collection = function() {
-		//	return mongodb.Db.prototype.collectionOrig.apply(this, arguments);
-		//}
-
-		// !!!
-		// mongo driver luistert op de socket in een eigen continuation.
-		// de loop daarvan roept callbacks aan die gepushed zijn aan een array.
-		// dus clStore.bind() is nodig.
-		//
-		// dit verklaart ook waarom we soms 2 verschillende txnIds zagen in dezelfde
-		// request. de connectie was gemaakt in een vorig request met een andere txnId.
-		mongodb.Db.prototype._origExecuteQueryCommand = mongodb.Db.prototype._executeQueryCommand;
-		mongodb.Db.prototype._executeQueryCommand = function() {
-			if (arguments.length > 0 && typeof(arguments[arguments.length - 1]) === 'function') {
-				var callback = clStore.bind(arguments[arguments.length - 1]);
-				var newArgs = [];
-				for (var i = 0; i < arguments.length - 1; i++) {
-					newArgs.push(arguments[i]);
-				}
-				newArgs.push(callback);
-				this._origExecuteQueryCommand.apply(this, newArgs);
-			} else {
-				this._origExecuteQueryCommand.apply(this, arguments);
-			}
-		}
-
-		mongodb.Db.prototype._origExecuteInsertCommand = mongodb.Db.prototype._executeInsertCommand;
-		mongodb.Db.prototype._executeInsertCommand = function() {
-			if (arguments.length > 0 && typeof(arguments[arguments.length - 1]) === 'function') {
-				var callback = clStore.bind(arguments[arguments.length - 1]);
-				var newArgs = [];
-				for (var i = 0; i < arguments.length - 1; i++) {
-					newArgs.push(arguments[i]);
-				}
-				newArgs.push(callback);
-				this._origExecuteInsertCommand.apply(this, newArgs);
-			} else {
-				this._origExecuteInsertCommand.apply(this, arguments);
-			}
-		}
-
 		for (i = 0; i < collectionMethods.length; i++) {
 			instrumentCollectionMethod(mongodb.Collection.prototype, collectionMethods[i], collectionFn);
 		}
 	} catch (e) {
 		log.error("Unable to instrument MongoDB due to error: " + e);
+	}
+}
+
+function wrapRepairCLSMongo14() {
+	try {
+		if (!mongodb.Db.prototype._executeQueryCommand || mongodb.Db.prototype._executeInsertCommand) {
+			log.verbose("Not using MongoDB 1.4.x, so don't need MongoDB continuation-local-storage workaround");
+			return;
+		}
+		
+		mongodb.Db.prototype._passenger_wrapped__executeQueryCommand = mongodb.Db.prototype._executeQueryCommand;
+		mongodb.Db.prototype._executeQueryCommand = function() {
+			if (arguments.length > 0 && typeof(arguments[arguments.length - 1]) === 'function') {
+				var callback = reqNamespace.bind(arguments[arguments.length - 1]);
+				var newArgs = [];
+				for (var i = 0; i < arguments.length - 1; i++) {
+					newArgs.push(arguments[i]);
+				}
+				newArgs.push(callback);
+				this._passenger_wrapped__executeQueryCommand.apply(this, newArgs);
+			} else {
+				this._passenger_wrapped__executeQueryCommand.apply(this, arguments);
+			}
+		}
+
+		mongodb.Db.prototype._passenger_wrapped__executeInsertCommand = mongodb.Db.prototype._executeInsertCommand;
+		mongodb.Db.prototype._executeInsertCommand = function() {
+			if (arguments.length > 0 && typeof(arguments[arguments.length - 1]) === 'function') {
+				var callback = reqNamespace.bind(arguments[arguments.length - 1]);
+				var newArgs = [];
+				for (var i = 0; i < arguments.length - 1; i++) {
+					newArgs.push(arguments[i]);
+				}
+				newArgs.push(callback);
+				this._passenger_wrapped__executeInsertCommand.apply(this, newArgs);
+			} else {
+				this._passenger_wrapped__executeInsertCommand.apply(this, arguments);
+			}
+		}
+		log.verbose("Using MongoDB 1.4.x continuation-local-storage workaround");
+	} catch (e) {
+		log.error("Not using MongoDB continuation-local-storage workaround: " + e);
+	}
+}
+
+// Mongoskin utils creates skin (wrapper) classes and in the process introduce an emitter for supporting
+// delayed open() (e.g. while the driver is still connecting).
+// The emitter breaks continuation-local-storage, but since it is for top-level classes (Db, Collection, etc.)
+// we can't bind it per request, so we need to bind the individual callbacks that get pushed onto it.
+function wrapRepairCLSMongoskinUtils(appRoot) {
+	var mongoskinUtils;
+	try {
+		mongoskinUtils = require(appRoot + "/node_modules/mongoskin/lib/utils");
+	} catch (e) {
+		log.verbose("Not using mongoskin continuation-local-storage workaround (either not used, old version, or new unsupported version): " + e);
+		return;
+	}
+	
+	try {
+		// makeSkinClass is a factory, so need a double wrap: one to get the run-time factory output (skinClass),
+		// and then one that hooks the actual method in that output.
+		mongoskinUtils._passenger_wrapped_makeSkinClass = mongoskinUtils.makeSkinClass;
+		mongoskinUtils.makeSkinClass = function(NativeClass, useNativeConstructor) {
+			var skinClass = mongoskinUtils._passenger_wrapped_makeSkinClass(NativeClass, useNativeConstructor);
+	
+			skinClass.prototype._passenger_wrapped_open = skinClass.prototype.open;
+			skinClass.prototype.open = function(callback) {
+				// Finally we can bind the callback so that when the emitter calls it, the cls is mapped correctly.
+				// var reqNamespace = localStorage.getNamespace('passenger-request-ctx');
+				return skinClass.prototype._passenger_wrapped_open.call(this, reqNamespace.bind(callback));
+			}
+	
+			return skinClass;
+		}
+		log.verbose("Using mongoskin continuation-local-storage workaround");
+	} catch (e) {
+		log.error("Not using mongoskin continuation-local-storage workaround (probably an unsupported version): " + e);
 	}
 }
 
