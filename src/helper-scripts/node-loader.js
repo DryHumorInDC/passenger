@@ -32,8 +32,9 @@ var http = require('http');
 
 var LineReader = require('phusion_passenger/line_reader').LineReader;
 var ustLog = require('phusion_passenger/ustrouter_connector');
-var logExpress = require('phusion_passenger/log_express');
-var logMongoDB = require('phusion_passenger/log_mongodb');
+
+var instrumentModulePaths = [ 'phusion_passenger/log_express', 'phusion_passenger/log_mongodb'];
+var instrumentedModules = [];
 
 module.isApplicationLoader = true; // https://groups.google.com/forum/#!topic/compoundjs/4txxkNtROQg
 GLOBAL.PhusionPassenger = exports.PhusionPassenger = new EventEmitter();
@@ -122,8 +123,12 @@ function setupEnvironment(options) {
 		PhusionPassenger.options.ust_router_password, PhusionPassenger.options.union_station_key, PhusionPassenger.options.app_group_name);
 
 	if (ustLog.isEnabled()) {
-		logExpress.initPreLoad(logger, options.app_root, ustLog);
-		logMongoDB.initPreLoad(logger, options.app_root, ustLog);
+		require('continuation-local-storage').createNamespace('passenger-request-ctx');
+		instrumentModulePaths.forEach(function(modulePath) {
+			var module = require(modulePath);
+			instrumentedModules.push(module);
+			module.initPreLoad(logger, options.app_root, ustLog);
+		});
 	}
 
 	stdinReader.close();
@@ -134,8 +139,9 @@ function setupEnvironment(options) {
 	loadApplication();
 	
 	if (ustLog.isEnabled()) {
-		logExpress.initPostLoad();
-		logMongoDB.initPostLoad();
+		instrumentedModules.forEach(function(module) {
+			module.initPostLoad();
+		});
 	}
 }
 
