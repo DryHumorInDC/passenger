@@ -27,8 +27,7 @@ var log;
 var express;
 var ustLog;
 
-var createNamespace = require('continuation-local-storage').createNamespace;
-var clStore = createNamespace('passenger-request-ctx');
+var reqNamespace = require('continuation-local-storage').getNamespace('passenger-request-ctx');
 
 var applicationThis;
 
@@ -102,13 +101,13 @@ function logRequest(req, res, next) {
 	var logBuf = [];
 	logBuf.push("Got request for: " + req.url);
 
-	clStore.bindEmitter(req);
-	clStore.bindEmitter(res);
+	reqNamespace.bindEmitter(req);
+	reqNamespace.bindEmitter(res);
 
 	ustLog.logToUstTransaction("requests", logBuf, attachToTxnId);
 
-	clStore.run(function() {
-		clStore.set("attachToTxnId", attachToTxnId);
+	reqNamespace.run(function() {
+		reqNamespace.set("attachToTxnId", attachToTxnId);
 		next();
 	});
 }
