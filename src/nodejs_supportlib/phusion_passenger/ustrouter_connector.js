@@ -63,7 +63,7 @@ function setDefaults() {
 	pendingTxnBuf = [];
 	pendingTxnBufMaxLength = 5000;
 	connTimeoutMs = 10000;
-	autoRetryAfterMs = 10000;
+	autoRetryAfterMs = 30000;
 }
 
 // Call to initiate a connection with the UstRouter. If called with incomplete parameters the connector will just be
