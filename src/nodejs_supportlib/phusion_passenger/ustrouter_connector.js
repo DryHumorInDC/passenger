@@ -163,6 +163,27 @@ function LogTransaction(cat) {
 	this.state = 0; // 0: untouched, 1: open sent, 2: close sent
 }
 
+function findLastPendingTxnForId(txnId) {
+	for (i = pendingTxnBuf.length - 1; i >= 0; i--) {
+		if (pendingTxnBuf[i].txnId == txnId) {
+			return pendingTxnBuf[i];
+		}
+	}
+}
+
+exports.deferIfPendingTxns = function(txnId, deferThis, deferFn, deferArgs) {
+	var txn = findLastPendingTxnForId(txnId);
+	
+	if (!txn) {
+		return deferFn.apply(deferThis, deferArgs);
+	} else {
+		log.debug("defer response.end() for txn " + txnId);
+		txn.deferThis = deferThis;
+		txn.deferFn = deferFn;
+		txn.deferArgs = deferArgs;
+	}
+}
+
 // Example categories are "requests", "exceptions". The lineArray is a specific format parsed by Union STation.
 // txnIfContinue is an optional txnId and attaches the log to an existing transaction with the specified txnId.
 // N.B. transactions will be dropped if the outgoing buffer limit is reached.
@@ -227,18 +248,33 @@ function pushPendingData() {
 			// open was sent, still waiting for OK.
 			break;
 			
-		case 2:			
+		case 2:
 			// txn is open, log the data & close
 			log.debug("log & close transaction(" + pendingTxnBuf[0].txnId + ")");
 			txn = pendingTxnBuf.shift();
+			
+			if (txn.deferFn) {
+				var moveToTxn = findLastPendingTxnForId(txn.txnId);
+				if (!moveToTxn) {
+					log.debug("found deferred response.end(), no other queued attachments for txn " + txn.txnId + ", so calling now that it's safe");
+					txn.deferFn.apply(txn.deferThis, txn.deferArgs);
+				} else {
+					log.debug("moving deferred response.end() because there are other relevant attachment(s) for txn " + txn.txnId);
+					moveToTxn.deferThis = txn.deferThis;
+					moveToTxn.deferFn = txn.deferFn;
+					moveToTxn.deferArgs = txn.deferArgs;
+				}
+			}
+
 			for (i = 0; i < txn.logBuf.length; i++) {
 				writeLenArray(routerConn, "log\0" + txn.txnId + "\0" + codify.toCode(txn.timestamp) + "\0");
 				writeLenString(routerConn, txn.logBuf[i]);
 			}
-	
+
 			changeState(7); // expect ok in onData()..
 			setWatchdog(connTimeoutMs);
 			writeLenArray(routerConn, "closeTransaction\0" + txn.txnId + "\0" + codify.toCode(microtime.now()) + "\0true\0");
+			log.verbose("wrote log and close for " + txn.txnId);
 			break;
 		
 		default:
